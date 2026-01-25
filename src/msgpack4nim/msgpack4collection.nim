@@ -4,13 +4,10 @@ import tables, intsets, lists, deques, sets, strtabs, critbits, streams
 {.push gcsafe.}
 
 proc pack_type*(s: Stream, val: IntSet) =
-  var ss = MsgStream.init()
-  var count = 0
-  for i in items(val):
-    ss.pack_imp_int(i)
-    inc(count)
+  let count = val.len
   s.pack_array(count)
-  s.write(ss.data)
+  for i in items(val):
+    s.pack_imp_int(i)
 
 proc pack_type*[Stream, T](s: Stream, val: SinglyLinkedList[T]) =
   s.pack_items_imp(val)
