@@ -960,39 +960,38 @@ proc is_int*(s: Stream): bool =
     return true
 
 proc skip_msg*(s: Stream) =
-  let c = ord(s.peekChar)
-  var len = 0
-  case c
-  of 0x00..0x7f, 0xc0..0xc3, 0xe0..0xff:
-    discard s.readChar()
-  of 0x80..0x8f, 0xde..0xdf:
-    len = s.unpack_map()
-    for i in 0..len-1:
-      skip_msg(s)
-      skip_msg(s)
-  of 0x90..0x9f, 0xdc..0xdd:
-    len = s.unpack_array()
-    for i in 0..len-1:
-      skip_msg(s)
-  of 0xa0..0xbf, 0xd9..0xdb:
-    len = s.unpack_string()
-    discard s.readExactStr(len)
-  of 0xc4..0xc6:
-    len = s.unpack_bin()
-    discard s.readExactStr(len)
-  of 0xc7..0xc9, 0xd4..0xd8:
-    let (_, extlen) = s.unpack_ext()
-    discard s.readExactStr(extlen)
-  of 0xca:
-    discard s.unpack_imp_float32()
-  of 0xcb:
-    discard s.unpack_imp_float64()
-  of 0xcc..0xcf:
-    discard s.unpack_imp_uint64()
-  of 0xd0..0xd3:
-    discard s.unpack_imp_int64()
-  else:
-    raise conversionError("unknown command during skip")
+  var pending = 1
+  while pending > 0:
+    dec pending
+    let c = ord(s.peekChar)
+    case c
+    of 0x00..0x7f, 0xc0..0xc3, 0xe0..0xff:
+      discard s.readChar()
+    of 0x80..0x8f, 0xde..0xdf:
+      let len = s.unpack_map()
+      pending += len * 2
+    of 0x90..0x9f, 0xdc..0xdd:
+      let len = s.unpack_array()
+      pending += len
+    of 0xa0..0xbf, 0xd9..0xdb:
+      let len = s.unpack_string()
+      discard s.readExactStr(len)
+    of 0xc4..0xc6:
+      let len = s.unpack_bin()
+      discard s.readExactStr(len)
+    of 0xc7..0xc9, 0xd4..0xd8:
+      let (_, extlen) = s.unpack_ext()
+      discard s.readExactStr(extlen)
+    of 0xca:
+      discard s.unpack_imp_float32()
+    of 0xcb:
+      discard s.unpack_imp_float64()
+    of 0xcc..0xcf:
+      discard s.unpack_imp_uint64()
+    of 0xd0..0xd3:
+      discard s.unpack_imp_int64()
+    else:
+      raise conversionError("unknown command during skip")
 
 proc unpack_type*[Stream; T: tuple|object](s: Stream, val: var T) =
   template dry_and_wet(): untyped =
