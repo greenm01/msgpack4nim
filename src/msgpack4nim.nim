@@ -842,13 +842,11 @@ template unpack_items_imp*(s: typed, val: typed, msg: typed) =
   let len = s.unpack_array()
   if len < 0: raise conversionError(msg)
 
-  var y: seq[T] = @[]
+  var y = newSeq[T](len)
   for i in 0..len-1:
-    var x: T
-    s.unpack(x)
-    y.add(x)
-  for i in 0..len-1:
-    val.prepend(y.pop())
+    s.unpack(y[i])
+  for i in countdown(len - 1, 0):
+    val.prepend(y[i])
 
 proc unpack_map*(s: Stream): int =
   result = -1
@@ -873,17 +871,13 @@ proc unpack_type*[Stream, T](s: Stream, val: var seq[T]) =
   if len < 0: raise conversionError("sequence")
   val = newSeq[T](len)
   for i in 0..len-1:
-    var x:T
-    s.unpack(x)
-    val[i] = x
+    s.unpack(val[i])
 
 proc unpack_type*[Stream, T](s: Stream, val: var openarray[T]) =
   let len = s.unpack_array()
   if len < 0: raise conversionError("openarray")
   for i in 0..len-1:
-    var x:T
-    s.unpack(x)
-    val[i] = x
+    s.unpack(val[i])
 
 proc unpack_type*[Stream; T: enum|range](s: Stream, val: var T) =
   when val is range:
@@ -905,6 +899,101 @@ macro unpack_proxy(n: typed): untyped =
   else:
     result = quote do:
       s.unpack `n`
+
+macro unpack_field_by_name(T: typedesc, val: typed, name: untyped): untyped =
+  proc baseIdent(n: NimNode): NimNode =
+    case n.kind
+    of nnkIdent, nnkSym:
+      n
+    of nnkPostfix:
+      baseIdent(n[1])
+    of nnkPragmaExpr:
+      baseIdent(n[0])
+    else:
+      n
+
+  proc addIdentDefs(node: NimNode, fields: var seq[NimNode]) =
+    if node.kind == nnkIdentDefs:
+      fields.add(baseIdent(node[0]))
+
+  proc collectRecList(recList: NimNode, fields: var seq[NimNode]) =
+    for item in recList:
+      case item.kind
+      of nnkIdentDefs:
+        addIdentDefs(item, fields)
+      of nnkRecCase:
+        addIdentDefs(item[0], fields)
+        for i in 1..<item.len:
+          let branch = item[i]
+          if branch.kind in {nnkOfBranch, nnkElse}:
+            if branch.len > 0:
+              collectRecList(branch[^1], fields)
+      else:
+        discard
+
+  proc collectObjectFields(t: NimNode, fields: var seq[NimNode]) =
+    var tt = t
+    case tt.kind
+    of nnkRefTy, nnkPtrTy:
+      tt = tt[0].getTypeImpl
+    else:
+      discard
+    if tt.kind != nnkObjectTy:
+      return
+    let base = tt[1]
+    if base.kind != nnkEmpty:
+      collectObjectFields(base.getTypeImpl, fields)
+    let recList = tt[2]
+    if recList.kind == nnkRecList:
+      collectRecList(recList, fields)
+
+  var t = T.getTypeImpl
+  if t.kind == nnkBracketExpr:
+    t = t[1].getTypeImpl
+
+  var fields: seq[NimNode] = @[]
+  collectObjectFields(t, fields)
+
+  let matched = genSym(nskVar, "matched")
+  var caseStmt = newTree(nnkCaseStmt, name)
+  for field in fields:
+    let fieldName = field.strVal
+    let fieldAccess = newDotExpr(val, field)
+    caseStmt.add newTree(nnkOfBranch, newLit(fieldName), newStmtList(
+      quote do:
+        `matched` = true
+        unpack_proxy(`fieldAccess`)
+    ))
+  caseStmt.add newTree(nnkElse, newStmtList())
+
+  result = newStmtList()
+  result.add quote do:
+    var `matched` = false
+  result.add caseStmt
+  result.add matched
+
+macro is_case_object(T: typedesc): untyped =
+  var a = T.getTypeImpl
+  if a.kind != nnkBracketExpr:
+    return newLit(false)
+  let sym = a[1]
+  let t = sym.getTypeImpl
+  var t2: NimNode
+  case t.kind
+  of nnkObjectTy:
+    t2 = t[2]
+  of nnkRefTy:
+    let base = t[0].getTypeImpl
+    if base.kind != nnkObjectTy:
+      return newLit(false)
+    t2 = base[2]
+  else:
+    return newLit(false)
+  if t2.kind == nnkRecList:
+    for ti in t2:
+      if ti.kind == nnkRecCase:
+        return newLit(true)
+  result = newLit(false)
 
 proc is_string*(s: Stream): bool =
   let c = s.peekChar
@@ -999,21 +1088,24 @@ proc unpack_type*[Stream; T: tuple|object](s: Stream, val: var T) =
     when defined(msgpack_obj_to_map):
       let len = s.unpack_map()
       var name: string
-      var found: bool
       for i in 0..len-1:
         if not s.is_string:
           s.skip_msg()
           s.skip_msg()
           continue
         unpack_proxy(name)
-        found = false
-        for field, value in fieldPairs(val):
-          if field == name:
-            found = true
-            unpack_proxy(value)
-            break
-        if not found:
-          s.skip_msg()
+        when T is object:
+          if not unpack_field_by_name(T, val, name):
+            s.skip_msg()
+        else:
+          var found = false
+          for field, value in fieldPairs(val):
+            if field == name:
+              found = true
+              unpack_proxy(value)
+              break
+          if not found:
+            s.skip_msg()
     elif defined(msgpack_obj_to_stream):
       for field in fields(val):
         unpack_proxy(field)
@@ -1025,40 +1117,51 @@ proc unpack_type*[Stream; T: tuple|object](s: Stream, val: var T) =
         inc length
       doAssert(arrayLen == length, "object/tuple len mismatch")
 
-  when Stream is MsgStream:
-    case s.encodingMode
-    of MSGPACK_OBJ_TO_ARRAY:
-      let arrayLen = s.unpack_array()
-      var len = 0
-      for field in fields(val):
-        unpack_proxy(field)
-        inc len
-      doAssert(arrayLen == len, "object/tuple len mismatch")
-    of MSGPACK_OBJ_TO_MAP:
-      let len = s.unpack_map()
-      var name: string
-      var found: bool
-      for i in 0..len-1:
-        if not s.is_string:
-          s.skip_msg()
-          s.skip_msg()
-          continue
-        unpack_proxy(name)
-        found = false
-        for field, value in fieldPairs(val):
-          if field == name:
-            found = true
-            unpack_proxy(value)
-            break
-        if not found:
-          s.skip_msg()
-    of MSGPACK_OBJ_TO_STREAM:
-      for field in fields(val):
-        unpack_proxy(field)
+  template impl(): untyped =
+    when Stream is MsgStream:
+      case s.encodingMode
+      of MSGPACK_OBJ_TO_ARRAY:
+        let arrayLen = s.unpack_array()
+        var len = 0
+        for field in fields(val):
+          unpack_proxy(field)
+          inc len
+        doAssert(arrayLen == len, "object/tuple len mismatch")
+      of MSGPACK_OBJ_TO_MAP:
+        let len = s.unpack_map()
+        var name: string
+        for i in 0..len-1:
+          if not s.is_string:
+            s.skip_msg()
+            s.skip_msg()
+            continue
+          unpack_proxy(name)
+          when T is object:
+            if not unpack_field_by_name(T, val, name):
+              s.skip_msg()
+          else:
+            var found = false
+            for field, value in fieldPairs(val):
+              if field == name:
+                found = true
+                unpack_proxy(value)
+                break
+            if not found:
+              s.skip_msg()
+      of MSGPACK_OBJ_TO_STREAM:
+        for field in fields(val):
+          unpack_proxy(field)
+      else:
+        dry_and_wet()
     else:
       dry_and_wet()
+
+  when is_case_object(T):
+    {.push warning[CaseTransition]: off.}
+    impl()
+    {.pop.}
   else:
-    dry_and_wet()
+    impl()
 
 proc unpack_type*[Stream; T: ref](s: Stream, val: var T) =
   if s.peekChar == pack_value_nil:
