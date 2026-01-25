@@ -114,6 +114,9 @@ template undistinct_unpack*(s, f, x) =
   else:
     f(s, distinctBase(x))
 
+
+
+
 when system.cpuEndian == littleEndian:
   proc take8_8(val: uint8): uint8 {.inline.} = val
   proc take8_16(val: uint16): uint8 {.inline.} = uint8(val and 0xFF)
@@ -627,13 +630,20 @@ proc pack_type*[Stream, T](s: Stream, val: set[T]) =
     s.pack_imp_uint64(uint64(e))
 
 proc pack_items_imp*[Stream, T](s: Stream, val: T) {.inline.} =
-  var ss = MsgStream.init(sizeof(T))
-  var count = 0
-  for i in items(val):
-    undistinct_pack(ss, pack, i)
-    inc(count)
-  s.pack_array(count)
-  s.write(ss.data)
+  mixin pack_type
+  when compiles(val.len):
+    let count = val.len
+    s.pack_array(count)
+    for i in items(val):
+      undistinct_pack(s, pack_type, i)
+  else:
+    var ss = MsgStream.init(sizeof(T))
+    var count = 0
+    for i in items(val):
+      undistinct_pack(ss, pack, i)
+      inc(count)
+    s.pack_array(count)
+    s.write(ss.data)
 
 proc pack_map_imp*[Stream, T](s: Stream, val: T) {.inline.} =
   mixin pack_type
@@ -667,8 +677,11 @@ proc pack_type*[Stream; T: enum|range](s: Stream, val: T) =
 proc pack_type*[Stream; T: tuple|object](s: Stream, val: T) =
   mixin pack_type
   var len = 0
-  for field in fields(val):
-    inc(len)
+  when T is tuple:
+    len = tupleLen(T)
+  else:
+    for field in fields(val):
+      inc(len)
 
   template dry_and_wet() =
     when defined(msgpack_obj_to_map):
@@ -914,7 +927,8 @@ macro unpack_field_by_name(T: typedesc, val: typed, name: untyped): untyped =
 
   proc addIdentDefs(node: NimNode, fields: var seq[NimNode]) =
     if node.kind == nnkIdentDefs:
-      fields.add(baseIdent(node[0]))
+      for i in 0..node.len-3:
+        fields.add(baseIdent(node[i]))
 
   proc collectRecList(recList: NimNode, fields: var seq[NimNode]) =
     for item in recList:
@@ -971,6 +985,7 @@ macro unpack_field_by_name(T: typedesc, val: typed, name: untyped): untyped =
     var `matched` = false
   result.add caseStmt
   result.add matched
+
 
 macro is_case_object(T: typedesc): untyped =
   var a = T.getTypeImpl
@@ -1153,22 +1168,32 @@ proc unpack_type*[Stream; T: tuple|object](s: Stream, val: var T) =
         unpack_proxy(field)
     else:
       let arrayLen = s.unpack_array()
-      var length = 0
-      for field in fields(val):
-        unpack_proxy(field)
-        inc length
-      doAssert(arrayLen == length, "object/tuple len mismatch")
+      when T is tuple:
+        for field in fields(val):
+          unpack_proxy(field)
+        doAssert(arrayLen == tupleLen(T), "object/tuple len mismatch")
+      else:
+        var length = 0
+        for field in fields(val):
+          unpack_proxy(field)
+          inc length
+        doAssert(arrayLen == length, "object/tuple len mismatch")
 
   template impl(): untyped =
     when Stream is MsgStream:
       case s.encodingMode
       of MSGPACK_OBJ_TO_ARRAY:
         let arrayLen = s.unpack_array()
-        var len = 0
-        for field in fields(val):
-          unpack_proxy(field)
-          inc len
-        doAssert(arrayLen == len, "object/tuple len mismatch")
+        when T is tuple:
+          for field in fields(val):
+            unpack_proxy(field)
+          doAssert(arrayLen == tupleLen(T), "object/tuple len mismatch")
+        else:
+          var len = 0
+          for field in fields(val):
+            unpack_proxy(field)
+            inc len
+          doAssert(arrayLen == len, "object/tuple len mismatch")
       of MSGPACK_OBJ_TO_MAP:
         let len = s.unpack_map()
         var name: string
